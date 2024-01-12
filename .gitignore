@@ -18,3 +18,5 @@ infra/cdk.out
 infra/bin/*
 lambda/bin/*
 *.DS_Store
+
+.node-version
