@@ -28,8 +28,12 @@ func Handler(ctx context.Context, e events.SQSEvent) error {
 		return nil
 	}
 
-	subnetIds := removeDuplicateValue(strings.Split(subnets, ","))
-	securityGroupIds := removeDuplicateValue(strings.Split(securityGroups, ","))
+	/*
+		subnetIds := removeDuplicateValue(strings.Split(subnets, ","))
+		securityGroupIds := removeDuplicateValue(strings.Split(securityGroups, ","))
+	*/
+	subnetIds := strings.Split(subnets, ",")
+	securityGroupIds := strings.Split(securityGroups, ",")
 
 	client, err := newClient(ctx)
 	if err != nil {

@@ -3,15 +3,11 @@ package main
 import (
 	"fmt"
 	"infra/resources"
+	"strings"
 
 	"github.com/aws/aws-cdk-go/awscdk/v2"
-	ecr "github.com/aws/aws-cdk-go/awscdk/v2/awsecr"
-	ecs "github.com/aws/aws-cdk-go/awscdk/v2/awsecs"
-	"github.com/aws/aws-cdk-go/awscdk/v2/awsiam"
-	lambda "github.com/aws/aws-cdk-go/awscdk/v2/awslambda"
-	logs "github.com/aws/aws-cdk-go/awscdk/v2/awslogs"
-	"github.com/aws/aws-cdk-go/awscdk/v2/awss3"
-	sqs "github.com/aws/aws-cdk-go/awscdk/v2/awssqs"
+	ec2 "github.com/aws/aws-cdk-go/awscdk/v2/awsec2"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awssqs"
 	"github.com/aws/constructs-go/constructs/v10"
 	"github.com/aws/jsii-runtime-go"
 )
@@ -20,110 +16,172 @@ type InfraStackProps struct {
 	awscdk.StackProps
 }
 
-func NewInfraStack(scope constructs.Construct, id string, props *InfraStackProps) awscdk.Stack {
+type Props struct {
+	Project string
+}
+
+const (
+	Cidr string = "192.168.0.0/16"
+
+	LogBucketName string = "log-sandbox-sasaki"
+	LogGroupName  string = "log-group"
+)
+
+func name(a string, e string) string {
+	return fmt.Sprintf("%s-%s", strings.ToLower(a), e)
+}
+
+func NewInfraStack(scope constructs.Construct, id string, props *InfraStackProps, e Props) awscdk.Stack {
 	var sprops awscdk.StackProps
 	if props != nil {
 		sprops = props.StackProps
 	}
 	stack := awscdk.NewStack(scope, &id, &sprops)
+	var i resources.IResourceService = &resources.ResourceService{S: stack}
 
-	r := resources.NewVpc(stack)
-	repository := ecr.Repository_FromRepositoryName(stack, jsii.String("ecr"), jsii.String("task"))
-	logBucket := awss3.Bucket_FromBucketName(stack, jsii.String("bucket"), jsii.String("sasaki-2024-01-10"))
-	logGroup := logs.LogGroup_FromLogGroupName(stack, jsii.String("log"), jsii.String("log-group"))
-
-	cluster := ecs.NewCluster(stack, jsii.String("cluster"), &ecs.ClusterProps{
-		ClusterName:                    jsii.String("cluster"),
-		EnableFargateCapacityProviders: jsii.Bool(true),
-		Vpc:                            r.Vpc,
-		ExecuteCommandConfiguration: &ecs.ExecuteCommandConfiguration{
-			LogConfiguration: &ecs.ExecuteCommandLogConfiguration{
-				CloudWatchLogGroup:          logGroup,
-				CloudWatchEncryptionEnabled: jsii.Bool(true),
-				S3Bucket:                    logBucket,
-				S3EncryptionEnabled:         jsii.Bool(true),
-				S3KeyPrefix:                 jsii.String("log"),
-			},
-			Logging: ecs.ExecuteCommandLogging_OVERRIDE,
-		},
-	})
-
-	task := ecs.NewTaskDefinition(stack, jsii.String("task"), &ecs.TaskDefinitionProps{
-		Compatibility:   ecs.Compatibility_FARGATE,
-		Cpu:             jsii.String("256"),
-		MemoryMiB:       jsii.String("512"),
-		Family:          jsii.String("family"),
-		RuntimePlatform: &ecs.RuntimePlatform{CpuArchitecture: ecs.CpuArchitecture_X86_64()},
-	})
-
-	task.AddContainer(jsii.String("container"),
-		&ecs.ContainerDefinitionOptions{
-			Image:          ecs.ContainerImage_FromEcrRepository(repository, jsii.String("v0.1")),
-			Cpu:            jsii.Number(256),
-			MemoryLimitMiB: jsii.Number(512),
-			ContainerName:  jsii.String("container"),
-			Logging:        ecs.LogDriver_AwsLogs(&ecs.AwsLogDriverProps{StreamPrefix: jsii.String("cdklog"), LogGroup: logGroup}),
-			Environment:    &map[string]*string{},
-		},
+	var (
+		vpcName              = name(e.Project, "vpc")
+		securityGroupName    = name(e.Project, "sg")
+		repositoryName       = name(e.Project, "task-repository")
+		clusterName          = name(e.Project, "cluster")
+		taskName             = name(e.Project, "task")
+		containerName        = name(e.Project, "container")
+		queueName            = name(e.Project, "queue")
+		deadLetterQueueName  = name(e.Project, "dead-letter-queue")
+		lambdaAssumeRoleName = name(e.Project, "lambda-assume-role")
+		lambdaPrincipal      = "lambda.amazonaws.com"
+		lambdaFunctionName   = name(e.Project, "lambda-function")
 	)
 
-	dq := sqs.NewQueue(stack, jsii.String("dead-letter-queue"), &sqs.QueueProps{QueueName: jsii.String("dead-letter-queue")})
-	q := sqs.NewQueue(stack, jsii.String("queue"), &sqs.QueueProps{
-		QueueName:       jsii.String("queue"),
-		DeadLetterQueue: &sqs.DeadLetterQueue{MaxReceiveCount: jsii.Number(1), Queue: dq},
+	vpc := i.NewVpc(vpcName, Cidr)
+	securityGroup := i.NewSecurityGroup(securityGroupName, vpc)
+
+	i.NewVpcInterfaceEndpoint(resources.NewVpcEndpointProps{
+		SecurityGroup: securityGroup,
+		ServiceName:   name(e.Project, "ecr"),
+		Service:       ec2.InterfaceVpcEndpointAwsService_ECR(),
+		Subnets:       vpc.PrivateSubnets(),
+		Vpc:           vpc,
 	})
-	ar := awsiam.NewRole(stack, jsii.String("assume-role"), &awsiam.RoleProps{
-		AssumedBy: awsiam.NewServicePrincipal(jsii.String("lambda.amazonaws.com"), nil),
-		RoleName:  jsii.String("lambda-assume-role"),
+
+	i.NewVpcInterfaceEndpoint(resources.NewVpcEndpointProps{
+		SecurityGroup: securityGroup,
+		ServiceName:   name(e.Project, "dkr-ecr"),
+		Service:       ec2.InterfaceVpcEndpointAwsService_ECR_DOCKER(),
+		Subnets:       vpc.PrivateSubnets(),
+		Vpc:           vpc,
 	})
-	ar.AddToPolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
-		Actions:   &[]*string{jsii.String("sqs:*"), jsii.String("logs:*"), jsii.String("ecs:RunTask"), jsii.String("iam:PassRole")},
-		Effect:    awsiam.Effect_ALLOW,
-		Resources: &[]*string{jsii.String("*")},
-	}))
-	l := lambda.NewFunction(stack, jsii.String("lambda"), &lambda.FunctionProps{
-		FunctionName: jsii.String("function"),
-		MemorySize:   jsii.Number(512),
-		Handler:      jsii.String("infra/bin/handler"),
-		Runtime:      lambda.Runtime_GO_1_X(),
-		Code:         lambda.AssetCode_FromAsset(jsii.String("./bin/handler.zip"), nil),
-		Role:         ar,
-		Environment: &map[string]*string{
-			"Cluster":        cluster.ClusterName(),
-			"Task":           task.TaskDefinitionArn(),
-			"Container":      jsii.String("container"),
-			"Subnets":        jsii.String(r.SubnetIds),
-			"SecurityGroups": jsii.String(r.SecurityGroupIds),
+
+	i.NewVpcInterfaceEndpoint(resources.NewVpcEndpointProps{
+		SecurityGroup: securityGroup,
+		ServiceName:   name(e.Project, "logs-ecr"),
+		Service:       ec2.InterfaceVpcEndpointAwsService_CLOUDWATCH_LOGS(),
+		Subnets:       vpc.PrivateSubnets(),
+		Vpc:           vpc,
+	})
+
+	logBucket := i.GetBucketFromName(LogBucketName)
+	logGroup := i.GetLogGroupFromName(LogGroupName)
+
+	repository := i.NewEcrRepository(repositoryName)
+	i.NewCluster(resources.NewClusterProps{
+		Name:      clusterName,
+		LogBucket: logBucket,
+		LogGroup:  logGroup,
+		Vpc:       vpc,
+	})
+	taskDefinition := i.NewTaskDefinition(taskName)
+	i.AddContainer(resources.AddContainerProps{
+		Name:           containerName,
+		Tag:            "latest",
+		LogGroup:       logGroup,
+		TaskDefinition: taskDefinition,
+		Repository:     repository,
+	})
+
+	deadLetterQueue := i.NewQueue(deadLetterQueueName, nil)
+	queue := i.NewQueue(queueName, &awssqs.DeadLetterQueue{
+		MaxReceiveCount: jsii.Number(1),
+		Queue:           deadLetterQueue,
+	})
+
+	lambdaAssumeRole := i.NewAssumeRole(lambdaAssumeRoleName, lambdaPrincipal)
+	i.AddPolicyToRole(resources.AddPolicyToRoleProps{
+		Role:      lambdaAssumeRole,
+		Actions:   []string{"sqs:*", "logs:*", "ecs:RunTask", "iam:PassRole"},
+		Resources: []string{"*"},
+	})
+
+	i.NewLambdaFunction(resources.NewLambdaFunctionProps{
+		CodePath:       "./bin/handler.zip",
+		HandlerPath:    "infra/bin/handler",
+		EventSourceArn: queue.QueueArn(),
+		Name:           lambdaFunctionName,
+		Role:           lambdaAssumeRole,
+		Env: map[string]string{
+			"Cluster":        clusterName,
+			"Task":           *taskDefinition.TaskDefinitionArn(),
+			"Container":      containerName,
+			"Subnets":        i.RetrieveSubnetIds(vpc),
+			"SecurityGroups": *securityGroup.SecurityGroupId(),
 		},
-	})
-	l.AddEventSourceMapping(jsii.String("es-mapping"), &lambda.EventSourceMappingOptions{
-		EventSourceArn: q.QueueArn(),
 	})
 
 	return stack
 }
 
+const (
+	BootstrapBucketName string = "BBN"
+	ConnectionArn       string = "CARN"
+	Env                 string = "ENV"
+	GithubAccessToken   string = "GHAT"
+	GithubOwner         string = "GHO"
+	GithubRepository    string = "GHR"
+	HostedZoneId        string = "HGI"
+	Id                  string = "ID"
+	Project             string = "PROJECT"
+)
+
 func main() {
 	defer jsii.Close()
 
 	app := awscdk.NewApp(nil)
-	env := app.Node().TryGetContext(jsii.String("ENV"))
-	if env == nil {
+	var (
+		bbn     = app.Node().TryGetContext(jsii.String(BootstrapBucketName))
+		carn    = app.Node().TryGetContext(jsii.String(ConnectionArn))
+		env     = app.Node().TryGetContext(jsii.String(Env))
+		ght     = app.Node().TryGetContext(jsii.String(GithubAccessToken))
+		gho     = app.Node().TryGetContext(jsii.String(GithubOwner))
+		ghr     = app.Node().TryGetContext(jsii.String(GithubRepository))
+		hgi     = app.Node().TryGetContext(jsii.String(HostedZoneId))
+		id      = app.Node().TryGetContext(jsii.String(Id))
+		project = app.Node().TryGetContext(jsii.String(Project))
+	)
+
+	if bbn == nil || carn == nil || env == nil || ght == nil || gho == nil || ghr == nil || hgi == nil || project == nil || id == nil {
 		panic("please pass context")
 	}
 
-	awscdk.Tags_Of(app).Add(jsii.String("Project"), jsii.String("cdk"), nil)
-	awscdk.Tags_Of(app).Add(jsii.String("Env"), jsii.String(fmt.Sprintf("%s", env)), nil)
+	awscdk.Tags_Of(app).Add(jsii.String("Project"), jsii.String(project.(string)), nil)
 
-	NewInfraStack(app, "InfraStack", &InfraStackProps{
-		awscdk.StackProps{
-			Synthesizer: awscdk.NewDefaultStackSynthesizer(
-				&awscdk.DefaultStackSynthesizerProps{
-					FileAssetsBucketName: jsii.String("sasaki-2024-01-10"),
-				},
-			),
+	NewInfraStack(app, fmt.Sprintf("%sStack", project.(string)),
+		&InfraStackProps{
+			awscdk.StackProps{
+				Env: myenv(),
+				Synthesizer: awscdk.NewDefaultStackSynthesizer(
+					&awscdk.DefaultStackSynthesizerProps{
+						FileAssetsBucketName: jsii.String(bbn.(string)),
+						BucketPrefix:         jsii.String(fmt.Sprintf("%sStack/", project.(string))),
+					},
+				),
+			},
 		},
-	})
+		Props{
+			Project: project.(string),
+		},
+	)
 
 	app.Synth(nil)
 }
+
+func myenv() *awscdk.Environment { return nil }
